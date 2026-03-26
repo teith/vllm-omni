@@ -1395,13 +1395,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     ref_text = _as_singleton(info_dict.get("ref_text"))
                     if isinstance(ref_text, str) and ref_text.strip():
                         ref_ids = tok(
-                            self._build_ref_text(ref_text), return_tensors="pt", padding=False,
+                            self._build_ref_text(ref_text),
+                            return_tensors="pt",
+                            padding=False,
                         )["input_ids"].to(device=input_ids.device)
                     else:
-                        logger.warning(
-                            "Base ICL: ref_text/ref_ids missing, "
-                            "falling back to x-vector-only mode."
-                        )
+                        logger.warning("Base ICL: ref_text/ref_ids missing, falling back to x-vector-only mode.")
                         in_context_mode = False
             if in_context_mode:
                 icl_input_embed, trailing_text_hidden = self._generate_icl_prompt(
