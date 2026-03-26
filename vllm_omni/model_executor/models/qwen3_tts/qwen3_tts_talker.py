@@ -800,37 +800,43 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     )
 
                 codec_lens = 1 + int(ref_code_len)  # codec_bos + ref_code
-                if non_streaming_mode:
-                    # _generate_icl_prompt(non_streaming_mode=True):
-                    # text_embed = ref_ids + text_ids + eos.
-                    ref_ids = _first(info.get("ref_ids"), None)
-                    if isinstance(voice_clone_prompt, dict) and ref_ids is None:
-                        ref_ids = _first(voice_clone_prompt.get("ref_ids") or voice_clone_prompt.get("ref_id"), None)
+                # Resolve ref_id token count (shared by streaming & non-streaming).
+                ref_ids = _first(info.get("ref_ids"), None)
+                if isinstance(voice_clone_prompt, dict) and ref_ids is None:
+                    ref_ids = _first(voice_clone_prompt.get("ref_ids") or voice_clone_prompt.get("ref_id"), None)
 
-                    if ref_ids is None:
-                        ref_text = _first(info.get("ref_text"), "")
-                        if not isinstance(ref_text, str) or not ref_text.strip():
-                            raise ValueError(
-                                "Base in-context non-streaming requires `ref_text` or tokenized `ref_ids`."
-                            )
-                        ref_text_ids = tokenize_prompt(Qwen3TTSTalkerForConditionalGeneration._build_ref_text(ref_text))
-                        ref_ids_len = len(ref_text_ids)
-                    elif hasattr(ref_ids, "shape"):
-                        shape = getattr(ref_ids, "shape", None)
-                        ref_ids_len = int(shape[-1]) if shape else 0
-                    elif isinstance(ref_ids, list):
-                        ref_ids_len = len(ref_ids)
+                if ref_ids is None:
+                    ref_text = _first(info.get("ref_text"), "")
+                    if isinstance(ref_text, str) and ref_text.strip():
+                        ref_ids_len = len(
+                            tokenize_prompt(Qwen3TTSTalkerForConditionalGeneration._build_ref_text(ref_text))
+                        )
+                    elif non_streaming_mode:
+                        raise ValueError("Base in-context non-streaming requires `ref_text` or tokenized `ref_ids`.")
                     else:
                         ref_ids_len = 0
+                elif hasattr(ref_ids, "shape"):
+                    shape = getattr(ref_ids, "shape", None)
+                    ref_ids_len = int(shape[-1]) if shape else 0
+                elif isinstance(ref_ids, list):
+                    ref_ids_len = len(ref_ids)
+                else:
+                    ref_ids_len = 0
 
-                    # model uses ref_ids[:, 3:-2] (strip 5 tokens) and text_id=input_ids[:, 3:-5] (strip 8).
-                    ref_id_len = max(0, int(ref_ids_len) - 5)
-                    text_id_len = max(0, int(assistant_len) - 8)
+                ref_id_len = max(0, int(ref_ids_len) - 5)  # ref_ids[:, 3:-2]
+                text_id_len = max(0, int(assistant_len) - 8)  # input_ids[:, 3:-5]
+
+                if non_streaming_mode:
                     text_embed_len = ref_id_len + text_id_len + 1  # + eos
                     prompt_len += text_embed_len + codec_lens
                 else:
-                    # _generate_icl_prompt(non_streaming_mode=False): aligned to codec_lens.
-                    prompt_len += codec_lens
+                    # Streaming ICL split requires text_total > codec_lens.
+                    # When ref_audio is too long, fall back to xvec-only.
+                    text_total = ref_id_len + text_id_len + 1
+                    if text_total <= codec_lens:
+                        prompt_len += 1
+                    else:
+                        prompt_len += codec_lens
             else:
                 # Base without ICL behaves like CustomVoice.
                 if non_streaming_mode:
@@ -1398,15 +1404,44 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     ref_ids = tok(self._build_ref_text(ref_text), return_tensors="pt", padding=False)["input_ids"].to(
                         device=input_ids.device
                     )
-                icl_input_embed, trailing_text_hidden = self._generate_icl_prompt(
-                    text_id=input_ids[:, 3:-5],
-                    ref_id=ref_ids[:, 3:-2],
-                    ref_code=ref_code_t,  # type: ignore[arg-type]
-                    tts_pad_embed=tts_pad_embed,
-                    tts_eos_embed=tts_eos_embed,
-                    non_streaming_mode=non_streaming_mode,
-                )
-                talker_prompt = torch.cat([talker_prompt, icl_input_embed], dim=1)
+                # Streaming ICL requires text_total > codec_lens for the
+                # prefill/trailing split to put input_text into trailing.
+                # When ref_audio is too long all text lands in prefill and
+                # the model reproduces ref_text content.  Fall back to the
+                # same xvec-only streaming path used by non-ICL Base.
+                _icl_fallback_to_xvec = False
+                if not non_streaming_mode and ref_code_t is not None and ref_code_len is not None:
+                    _ref_id_count = int(ref_ids[:, 3:-2].shape[1])
+                    _icl_text_total = _ref_id_count + int(input_ids[:, 3:-5].shape[1]) + 1
+                    _codec_lens = 1 + int(ref_code_len)
+                    if _icl_text_total <= _codec_lens:
+                        logger.info(
+                            "ICL streaming: text_total %d ≤ codec_lens %d, falling back to xvec-only",
+                            _icl_text_total,
+                            _codec_lens,
+                        )
+                        _icl_fallback_to_xvec = True
+
+                if _icl_fallback_to_xvec:
+                    first_text = self.text_projection(self.text_embedding(input_ids[:, 3:4])) + codec_input[:, -1:]
+                    talker_prompt = torch.cat([talker_prompt, first_text], dim=1)
+                    trailing_text_hidden = torch.cat(
+                        (
+                            self.text_projection(self.text_embedding(input_ids[:, 4:-5])),
+                            tts_eos_embed,
+                        ),
+                        dim=1,
+                    )
+                else:
+                    icl_input_embed, trailing_text_hidden = self._generate_icl_prompt(
+                        text_id=input_ids[:, 3:-5],
+                        ref_id=ref_ids[:, 3:-2],
+                        ref_code=ref_code_t,  # type: ignore[arg-type]
+                        tts_pad_embed=tts_pad_embed,
+                        tts_eos_embed=tts_eos_embed,
+                        non_streaming_mode=non_streaming_mode,
+                    )
+                    talker_prompt = torch.cat([talker_prompt, icl_input_embed], dim=1)
             else:
                 # First text token (+ codec_bos).
                 if non_streaming_mode:
