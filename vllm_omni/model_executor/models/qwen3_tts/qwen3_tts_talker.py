@@ -286,7 +286,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
         self._codec_eos_token_id = int(getattr(self.talker_config, "codec_eos_token_id", -1))
 
-        self._eos_logit_bias: float = 0.0
+        self._eos_logit_bias: float = 5.0
 
         self.have_multimodal_outputs = True
         self.has_preprocess = True
