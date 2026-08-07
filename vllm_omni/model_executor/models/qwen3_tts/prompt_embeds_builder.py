@@ -36,6 +36,8 @@ import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 from vllm.multimodal.audio import AudioResampler
 
 from vllm_omni.utils.audio import mel_filter_bank
@@ -1115,7 +1117,14 @@ class Qwen3TTSPromptEmbedsBuilder:
             _cache_lookup_voice = None
             if voice_clone_prompt is None and self._speaker_cache is not None:
                 _speaker_list = info_dict.get("speaker")
-                if isinstance(_speaker_list, list) and _speaker_list:
+                # FIX: skip speaker cache for non-uploaded voices (created_at=0).
+                # voice="clone" with different ref_audio collides in speaker cache → cross-request contamination.
+                _voice_created_at_val = first_value(info_dict.get("voice_created_at"), 0)
+                _skip_cache = int(_voice_created_at_val or 0) == 0
+                if _skip_cache:
+                    logger.debug("[SPKCACHE-FIX] skipping speaker cache for non-uploaded voice (voice=%s created_at=0)",
+                                  _speaker_list[0] if _speaker_list else "N/A")
+                if isinstance(_speaker_list, list) and _speaker_list and not _skip_cache:
                     _voice_name = str(_speaker_list[0]).lower()
                     _cache_lookup_voice = _voice_name
                     # Per-mode namespace — xvec and icl produce different artifacts

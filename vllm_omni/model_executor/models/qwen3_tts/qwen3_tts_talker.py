@@ -299,6 +299,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
         self._codec_eos_token_id = int(getattr(self.talker_config, "codec_eos_token_id", -1))
 
+        self._eos_logit_bias: float = 0.0
+
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
@@ -559,6 +561,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         # Mask out invalid codec ids using the pre-built constant buffer.
         logits = logits.masked_fill(self._codec_disallowed_mask, float("-inf"))
+
+        # FIX: bias codec-EOS logit to help the model sample EOS reliably,
+        # preventing ICL runaway when the model loops on token 302 instead
+        # of emitting the stop token. See fix/qwen3-tts-speaker-cache-collision.
+        if self._eos_logit_bias != 0.0:
+            eos_id = self._codec_eos_token_id
+            if 0 <= eos_id < logits.shape[-1]:
+                logits[:, eos_id] = logits[:, eos_id] + self._eos_logit_bias
 
         return logits
 
